@@ -3,13 +3,13 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # hyperparameters
 block_size = 128 # Context length
 batch_size = 64 # Batches of input getting processed in parallel
 max_iters = 1000 # Number of training iterations
 learning_rate = 3e-4 
-device = "cuda" if torch.cuda.is_available() else "cpu"
 n_layer = 6 # number of layers in the GPT, or number of blocks
 n_embd = 32 # embedding dimention of the token
 n_head = 4 # number of heads in a single block
@@ -60,7 +60,7 @@ def get_batch(split):
     x, y = x.to(device), y.to(device)
     return x, y
 
-# Estimating training and validation loss for currently trained models
+# Estimating training and validation loss for the model-in-training
 @torch.no_grad()
 def estimate_loss():
     out = {}
@@ -76,7 +76,7 @@ def estimate_loss():
     return out
 
 """
-Single head in a layer
+Single head in a attention layer
 """
 class Head(nn.Module):
     # head_size is representing the dimentionality of Key and query space.
@@ -98,19 +98,20 @@ class Head(nn.Module):
         # Calculate queries for input tokens
         q = self.query(x) # (B, T, head_size)
 
-        # compute attention score ("affinities")
-        # divide by square root of embedding size to keep weights distributed
+        """
+        compute attention score ("affinities"). divide by square root of 
+        embedding size to keep weights distributed, and avoid sharp weights
+        """
         wei = (
             q @ k.transpose(-2, -1) * (C**0.5)
         )  # (B,T,head_size) @ (B, head_size, T) ---> (B, T, T)
-
+        
         """
         wei is the T * T matrix, which wei[i][j] shows affinity of ith token coming from jth token 
         in the input. We do not want any affinity from any token Y which is coming after a token X.
         So wei[i][j] should be zero when i < j. This is achieved by a upper triangular matrix masking.
         Before taking softmax, we make it -infinity so after softmax it becomes zero.
         """
-       
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
 
         """
@@ -118,35 +119,37 @@ class Head(nn.Module):
         And for each row sum of all numbers will be 1, and they will be between 0 and 1
         Now the weight matrix is a properly normalised
         """
-
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
 
         # Turn off random weights.
         wei = self.dropout(wei) # (B, T, T)
 
-        # Convert token embedding to a value embedding.
-        # In this case, size of value embedding in head_size
-        # because this is from a single head, and we will concatenate
-        # outputs from all heads. But this can change based on algorithm
+        """
+        Convert token embedding to a value embedding. As per 3Blue1Brown video,
+        this is essentially multiplying by value-down metrics. We'll do value-up
+        in the multihead block.
+        """
         v = self.value(x)  # (B, T, C) --->  #(B, T, head_size)
 
-
         """
-        For each token X in Token list T, Take weighted sum of values embedding 
+        For each token X in Token list T, take weighted sum of value embedding 
         of all tokens coming before X in the input. To ensure this, we had done 
-        matrix masking earlier. Weights are calculatd by key and query matrix
+        matrix masking earlier. Weights are calculatd by key and query matrix.
         """
-        
         out = wei @ v  # (B, T, T) @ (B, T, head_size) ----> (B, T, head_size)
 
         """
         This output should be added into the original token to make the token 
-        context rich
+        context rich.
         """
         return out
 
 """
-Multihead module, runs n heads in parallel for aggregation of attention
+Multihead attention block, runs n heads in parallel.
+Each head is supposed to specialise on the different
+type of context enrichment. In the end, we merge changes
+from all attention block to create the final delta
+matrix for each token
 """
 class MultiHeadAttention(nn.Module):
     """ Multiple heads of self attentions in parallel"""
@@ -157,11 +160,20 @@ class MultiHeadAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
-        # concetenate weights from all heads 
-        # (B, T, n_head * head_size) => (B, T, n_embd) or (B, T, C)
-        out = torch.cat([h(x) for h in self.heads], dim=-1) 
+        """
+        concetenate outputs from all heads
+        (B, T, n_head * head_size) => (B, T, n_embd) or (B, T, C)
+        """
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
 
-        out = self.dropout(self.proj(out)) # (num_heads*B, T, C)
+        """
+        multiplying the concatenated output matrix from all heads with proj
+        here is equavivalent to upscaling all the output matrix in each head 
+        itself to be equal to C, and then adding the output of all the heads
+        in this block. 
+        This optimisation is done to save number of matrix multiplications
+        """
+        out = self.dropout(self.proj(out)) # (B, T, C)
 
         return out
 
@@ -215,7 +227,7 @@ class BigramLanguageModel(nn.Module):
         # random embedding_table
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
 
-        # metrix to represent positional value of tokens
+        # Matrix to represent positional value of tokens
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
 
         self.blocks = nn.Sequential(*[Block(n_embd=n_embd, n_head=n_head) for _ in range(n_layer)])
@@ -230,10 +242,13 @@ class BigramLanguageModel(nn.Module):
     # idx is B*T table where each item represents a token.
     def forward(self, idx, targets=None):
 
+        """
+        B is number of batches running in parallel
+        T is number of tokens = block_size
+        C is embedding dimention = n_embd
+        """
         B, T = idx.shape
-        # C is embedding dimention = n_embd
-        # B -> number of batches running in parallel
-        # T is number of tokens = block_size
+
 
         token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
 
