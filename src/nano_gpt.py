@@ -6,19 +6,22 @@ from torch.nn import functional as F
 
 # hyperparameters
 block_size = 128 # Context length
-batch_size = 64
-train_split = 0.9
-max_iters = 1000
-eval_interval = 500
-learning_rate = 3e-4
+batch_size = 64 # Batches of input getting processed in parallel
+max_iters = 1000 # Number of training iterations
+learning_rate = 3e-4 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-eval_iterations = 200
-n_embd = 32
-n_layer = 6
-n_head = 4
+n_layer = 6 # number of layers in the GPT, or number of blocks
+n_embd = 32 # embedding dimention of the token
+n_head = 4 # number of heads in a single block
 # Turn off x% of random nodes during forward and backward pass to avoid overfitting
 dropout = 0.2
 # ----------------------------
+
+# These don't have any impact on GPT architecture
+train_split = 0.9
+eval_interval = 500 # Interval during training for doing evaluation
+eval_iterations = 200 # number of different samples for evaluating model performance
+# -----------------------
 
 torch.manual_seed(1337)
 
@@ -76,21 +79,24 @@ def estimate_loss():
 Single head in a layer
 """
 class Head(nn.Module):
+    # head_size is representing the dimentionality of Key and query space.
     def __init__(self, head_size):
         super().__init__()
-        # Key metrics
+        # Key matrix
         self.key = nn.Linear(n_embd, head_size, bias=False)
-        # Query metrics
+        # Query matrix
         self.query = nn.Linear(n_embd, head_size, bias=False)
-        # Value metrics
+        # Value matrix
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
+        # Calculate keys for input tokens
+        k = self.key(x) # (B, T, head_size)
+        # Calculate queries for input tokens
+        q = self.query(x) # (B, T, head_size)
 
         # compute attention score ("affinities")
         # divide by square root of embedding size to keep weights distributed
@@ -98,18 +104,45 @@ class Head(nn.Module):
             q @ k.transpose(-2, -1) * (C**0.5)
         )  # (B,T,head_size) @ (B, head_size, T) ---> (B, T, T)
 
+        """
+        wei is the T * T matrix, which wei[i][j] shows affinity of ith token coming from jth token 
+        in the input. We do not want any affinity from any token Y which is coming after a token X.
+        So wei[i][j] should be zero when i < j. This is achieved by a upper triangular matrix masking.
+        Before taking softmax, we make it -infinity so after softmax it becomes zero.
+        """
+       
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))  # (B, T, T)
+
+        """
+        After taking softmax, half of the matrix (right-upper half)  becomes 0.
+        And for each row sum of all numbers will be 1, and they will be between 0 and 1
+        Now the weight matrix is a properly normalised
+        """
 
         wei = F.softmax(wei, dim=-1)  # (B, T, T)
 
         # Turn off random weights.
         wei = self.dropout(wei) # (B, T, T)
 
-        # perform the weigthed aggregation of input values
-        v = self.value(x)  # (B, T, C)
+        # Convert token embedding to a value embedding.
+        # In this case, size of value embedding in head_size
+        # because this is from a single head, and we will concatenate
+        # outputs from all heads. But this can change based on algorithm
+        v = self.value(x)  # (B, T, C) --->  #(B, T, head_size)
 
-        out = wei @ v  # (B, T, T) @ (B, T, C) ----> (B, T, C)
 
+        """
+        For each token X in Token list T, Take weighted sum of values embedding 
+        of all tokens coming before X in the input. To ensure this, we had done 
+        matrix masking earlier. Weights are calculatd by key and query matrix
+        """
+        
+        out = wei @ v  # (B, T, T) @ (B, T, head_size) ----> (B, T, head_size)
+
+        """
+        This output should be added into the original token to make the token 
+        context rich
+        """
         return out
 
 """
@@ -125,7 +158,8 @@ class MultiHeadAttention(nn.Module):
     
     def forward(self, x):
         # concetenate weights from all heads 
-        out = torch.cat([h(x) for h in self.heads], dim=-1) # (num_heads*B, T, C)
+        # (B, T, n_head * head_size) => (B, T, n_embd) or (B, T, C)
+        out = torch.cat([h(x) for h in self.heads], dim=-1) 
 
         out = self.dropout(self.proj(out)) # (num_heads*B, T, C)
 
@@ -148,13 +182,19 @@ class FeedForwardLayer(nn.Module):
         return self.net(x)
 
 """
-Single block in the LLM
+Single block in the GPT
 """ 
 class Block(nn.Module):
     """Transformer block: Communication followed by computation"""
 
     def __init__(self, n_embd, n_head):
         super().__init__()
+        """
+        Output from a single head is of size (B, T, head_size), and outputs from all heads 
+        are concatenated so output dimention after that becomes (B, T, head_size * num_head)
+        We need the output in (B, T, n_embd). So we create the number of heads in such a way 
+        n_embd = head_size * num_heads
+        """
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(num_heads=n_head, head_size=head_size)
         self.ffwd = FeedForwardLayer(n_embd=n_embd)
@@ -184,14 +224,16 @@ class BigramLanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(n_embd)
 
         # Matrix for converting a single character of dimestion n to a
-        # probability metrics for each character in vocab.
+        # probability matrix for each character in vocab.
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
     # idx is B*T table where each item represents a token.
     def forward(self, idx, targets=None):
 
         B, T = idx.shape
-        # C is embedding dimention
+        # C is embedding dimention = n_embd
+        # B -> number of batches running in parallel
+        # T is number of tokens = block_size
 
         token_embeddings = self.token_embedding_table(idx)  # (B, T, C)
 
@@ -229,7 +271,7 @@ class BigramLanguageModel(nn.Module):
             logits, loss = self(idx_cond)
 
             # logit have dimention of (B, T, C)
-            # focus only on the last time step
+            # focus only on the last time step, or the last token
             logits = logits[:, -1, :]  # becomes (B, C)
 
             # apply softmax to get probabilities
